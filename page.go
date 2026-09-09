@@ -1072,6 +1072,7 @@ func (x TextHorizontal) Less(i, j int) bool {
 // of a document.
 type Outline struct {
 	Title string    // title for this element
+	Page  int       // page number this element points at, 1-based, or 0 if unknown
 	Child []Outline // child elements
 }
 
@@ -1079,14 +1080,19 @@ type Outline struct {
 // The Outline returned is the root of the outline tree and typically has no Title itself.
 // That is, the children of the returned root are the top-level entries in the outline.
 func (r *Reader) Outline() Outline {
-	return buildOutline(r.Trailer().Key("Root").Key("Outlines"))
+	root := r.Trailer().Key("Root").Key("Outlines")
+	if root.Kind() != Dict {
+		return Outline{}
+	}
+	return buildOutline(root, r.newDestinations())
 }
 
-func buildOutline(entry Value) Outline {
+func buildOutline(entry Value, dests *destinations) Outline {
 	var x Outline
 	x.Title = entry.Key("Title").Text()
+	x.Page = dests.pageOf(entry)
 	for child := entry.Key("First"); child.Kind() == Dict; child = child.Key("Next") {
-		x.Child = append(x.Child, buildOutline(child))
+		x.Child = append(x.Child, buildOutline(child, dests))
 	}
 	return x
 }

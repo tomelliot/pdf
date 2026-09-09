@@ -190,7 +190,7 @@ func TestBuildOutline(t *testing.T) {
 		},
 	})
 
-	got := buildOutline(entry)
+	got := buildOutline(entry, &destinations{})
 	want := Outline{
 		Title: "Root",
 		Child: []Outline{
