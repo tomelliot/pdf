@@ -72,6 +72,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 // DebugOn is responsible for logging messages into stdout. If problems arise during reading, set it true.
@@ -86,6 +87,36 @@ type Reader struct {
 	trailerptr objptr
 	key        []byte
 	useAES     bool
+
+	// cache holds each object the reader has already read from the file.
+	//
+	// Without it, every use of a value reads and parses the object again. A
+	// glyph width is three such reads, so a page of ten thousand glyphs is
+	// thirty thousand reads of the same few objects. On one 196 page document
+	// that was ten seconds of system calls against a tenth of a second of
+	// work.
+	//
+	// An object does not change once read, and this package never writes, so
+	// what the cache holds stays correct for the life of the reader.
+	cacheMu sync.Mutex
+	cache   map[objptr]Value
+}
+
+// cached returns an object the reader has already read.
+func (r *Reader) cached(ptr objptr) (Value, bool) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	v, ok := r.cache[ptr]
+	return v, ok
+}
+
+func (r *Reader) putCached(ptr objptr, v Value) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.cache == nil {
+		r.cache = make(map[objptr]Value)
+	}
+	r.cache[ptr] = v
 }
 
 type xref struct {
@@ -742,7 +773,11 @@ func (v Value) Len() int {
 }
 
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
+	original := x
 	if ptr, ok := x.(objptr); ok {
+		if v, hit := r.cached(ptr); hit {
+			return v
+		}
 		if ptr.id >= uint32(len(r.xref)) {
 			return Value{}
 		}
@@ -802,10 +837,12 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	}
 
 	switch x := x.(type) {
-	case nil, bool, int64, float64, name, dict, array, stream:
-		return Value{r, parent, x}
-	case string:
-		return Value{r, parent, x}
+	case nil, bool, int64, float64, name, dict, array, stream, string:
+		v := Value{r, parent, x}
+		if ptr, ok := original.(objptr); ok {
+			r.putCached(ptr, v)
+		}
+		return v
 	default:
 		panic(fmt.Errorf("unexpected value type %T in resolve", x))
 	}
