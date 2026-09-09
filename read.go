@@ -173,26 +173,15 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		return nil, fmt.Errorf("not a PDF file: invalid header")
 	}
 	end := size
-	const endChunk = 100
-	buf = make([]byte, endChunk)
-	f.ReadAt(buf, end-endChunk)
-	for len(buf) > 0 && buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r' {
-		buf = buf[:len(buf)-1]
-	}
-	buf = bytes.TrimRight(buf, "\r\n\t ")
-	if !bytes.HasSuffix(buf, []byte("%%EOF")) {
-		return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
-	}
-	i := findLastLine(buf, "startxref")
-	if i < 0 {
-		return nil, fmt.Errorf("malformed PDF file: missing final startxref")
+	pos, err := findStartxref(f, end)
+	if err != nil {
+		return nil, err
 	}
 
 	r = &Reader{
 		f:   f,
 		end: end,
 	}
-	pos := end - endChunk + int64(i)
 	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
 	if b.readToken() != keyword("startxref") {
 		return nil, fmt.Errorf("malformed PDF file: missing startxref")
@@ -488,6 +477,93 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 		}
 	}
 	return table, nil
+}
+
+// The end of the file, and why it is looked for rather than assumed.
+//
+// The specification puts %%EOF on the last line. Real files do not always: a
+// download can append a web page after the document, and an incremental update
+// leaves an earlier %%EOF behind. So the marker is looked for from the end,
+// and the startxref line that belongs to it is read from in front of it.
+const (
+	// eofChunk is how much of the file is read at a time while looking back
+	// for the marker.
+	eofChunk = 4096
+	// startxrefWindow is how much is read in front of a marker to find the
+	// startxref line. The line holds one keyword and one offset.
+	startxrefWindow = 2048
+	// eofCandidates bounds how many markers are tried. Trailing content that
+	// holds the text %%EOF is why more than one is tried at all; a file with
+	// many of them is a file this cannot help.
+	eofCandidates = 16
+)
+
+// findStartxref returns the offset of the startxref line that belongs to the
+// last usable %%EOF marker in f.
+//
+// A marker with no startxref line in front of it is not the end of a document,
+// so the search goes on to the one before it.
+func findStartxref(f io.ReaderAt, size int64) (int64, error) {
+	at := size
+	for tried := 0; tried < eofCandidates; tried++ {
+		marker, ok := findEOF(f, at)
+		if !ok {
+			if tried == 0 {
+				return 0, fmt.Errorf("not a PDF file: missing %%%%EOF")
+			}
+			break
+		}
+		if pos, ok := startxrefBefore(f, marker); ok {
+			return pos, nil
+		}
+		at = marker
+	}
+	return 0, fmt.Errorf("malformed PDF file: missing final startxref")
+}
+
+// findEOF returns the offset of the last %%EOF marker that starts before end.
+func findEOF(f io.ReaderAt, end int64) (int64, bool) {
+	marker := []byte("%%EOF")
+	// A marker can straddle two chunks, so each chunk reaches back over the
+	// end of the one before it by all but one byte of the marker.
+	overlap := int64(len(marker) - 1)
+
+	for end > 0 {
+		start := end - eofChunk
+		if start < 0 {
+			start = 0
+		}
+		buf := make([]byte, end-start)
+		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+			return 0, false
+		}
+		if i := bytes.LastIndex(buf, marker); i >= 0 {
+			return start + int64(i), true
+		}
+		if start == 0 {
+			return 0, false
+		}
+		end = start + overlap
+	}
+	return 0, false
+}
+
+// startxrefBefore returns the offset of the startxref line in front of a
+// marker.
+func startxrefBefore(f io.ReaderAt, marker int64) (int64, bool) {
+	start := marker - startxrefWindow
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, marker-start)
+	if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return 0, false
+	}
+	i := findLastLine(buf, "startxref")
+	if i < 0 {
+		return 0, false
+	}
+	return start + int64(i), true
 }
 
 func findLastLine(buf []byte, s string) int {
