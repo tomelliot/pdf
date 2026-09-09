@@ -811,6 +811,16 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 	}
 }
 
+// decodeParms is the parameters for the i'th filter in a filter array. A
+// dictionary rather than an array applies to whichever filter takes it, which
+// is the form writers use when only one filter has parameters.
+func decodeParms(param Value, i int) Value {
+	if param.Kind() == Array {
+		return param.Index(i)
+	}
+	return param
+}
+
 type errorReadCloser struct {
 	err error
 }
@@ -846,89 +856,51 @@ func (v Value) Reader() io.ReadCloser {
 	param := v.Key("DecodeParms")
 	switch filter.Kind() {
 	default:
-		panic(fmt.Errorf("unsupported filter %v", filter))
+		return &errorReadCloser{fmt.Errorf("unsupported filter %v", filter)}
 	case Null:
 		// ok
 	case Name:
-		rd = applyFilter(rd, filter.Name(), param)
+		var err error
+		if rd, err = applyFilter(rd, filter.Name(), param); err != nil {
+			return &errorReadCloser{err}
+		}
 	case Array:
+		// One DecodeParms entry belongs to each filter. A single dictionary
+		// applies to the one filter that takes parameters.
 		for i := 0; i < filter.Len(); i++ {
-			rd = applyFilter(rd, filter.Index(i).Name(), param.Index(i))
+			var err error
+			if rd, err = applyFilter(rd, filter.Index(i).Name(), decodeParms(param, i)); err != nil {
+				return &errorReadCloser{err}
+			}
 		}
 	}
 
 	return io.NopCloser(rd)
 }
 
-func applyFilter(rd io.Reader, name string, param Value) io.Reader {
+// applyFilter wraps rd so that it reads the decoded bytes of one filter.
+func applyFilter(rd io.Reader, name string, param Value) (io.Reader, error) {
 	switch name {
 	default:
-		panic("unknown filter " + name)
+		return nil, fmt.Errorf("unsupported filter %s", name)
 	case "FlateDecode":
 		zr, err := zlib.NewReader(rd)
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-		pred := param.Key("Predictor")
-		if pred.Kind() == Null {
-			return zr
-		}
-		columns := param.Key("Columns").Int64()
-		switch pred.Int64() {
-		default:
-			if DebugOn {
-				fmt.Println("unknown predictor", pred)
-			}
-			panic("pred")
-		case 12:
-			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
-		}
+		return applyPredictor(zr, param)
+	case "LZWDecode":
+		return applyPredictor(newLZWReader(rd, param), param)
 	case "ASCII85Decode":
-		cleanASCII85 := newAlphaReader(rd)
-		decoder := ascii85.NewDecoder(cleanASCII85)
-
-		switch param.Keys() {
-		default:
-			if DebugOn {
-				fmt.Println("param=", param)
-			}
-			panic("not expected DecodeParms for ascii85")
-		case nil:
-			return decoder
+		if param.Keys() != nil {
+			return nil, fmt.Errorf("unsupported DecodeParms for ASCII85Decode: %v", param)
 		}
+		return ascii85.NewDecoder(newAlphaReader(rd)), nil
+	case "ASCIIHexDecode":
+		return newASCIIHexReader(rd), nil
+	case "RunLengthDecode":
+		return newRunLengthReader(rd), nil
 	}
-}
-
-type pngUpReader struct {
-	r    io.Reader
-	hist []byte
-	tmp  []byte
-	pend []byte
-}
-
-func (r *pngUpReader) Read(b []byte) (int, error) {
-	n := 0
-	for len(b) > 0 {
-		if len(r.pend) > 0 {
-			m := copy(b, r.pend)
-			n += m
-			b = b[m:]
-			r.pend = r.pend[m:]
-			continue
-		}
-		_, err := io.ReadFull(r.r, r.tmp)
-		if err != nil {
-			return n, err
-		}
-		if r.tmp[0] != 2 {
-			return n, fmt.Errorf("malformed PNG-Up encoding")
-		}
-		for i, b := range r.tmp {
-			r.hist[i] += b
-		}
-		r.pend = r.hist[1:]
-	}
-	return n, nil
 }
 
 var passwordPad = []byte{
